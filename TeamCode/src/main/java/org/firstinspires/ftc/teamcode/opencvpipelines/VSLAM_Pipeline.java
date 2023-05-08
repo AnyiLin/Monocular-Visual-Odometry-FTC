@@ -39,6 +39,8 @@ public class VSLAM_Pipeline extends OpenCvPipeline {
     boolean empty;
 
     final int MIN_MATCHES = 5;
+    final int MAX_ITERATIONS_RANSAC = 1000;
+    final int RANSAC_REPROJECTION_THRESHOLD = 3;
 
     int width;
     int height;
@@ -48,6 +50,8 @@ public class VSLAM_Pipeline extends OpenCvPipeline {
     double fy;
     double cx;
     double cy;
+
+    final double INLIER_THRESHOLD_RANSAC = 2.0;
 
     final Size imgSize;
 
@@ -73,20 +77,15 @@ public class VSLAM_Pipeline extends OpenCvPipeline {
 
     MatOfPoint transformedCornersPoint;
 
-    MatOfPoint2f srcPoints;
-    MatOfPoint2f dstPoints;
     MatOfPoint2f corners;
     MatOfPoint2f transformedCorners;
+    MatOfPoint2f currentFrameNormalizedKeyPoints;
+    MatOfPoint2f previousFrameNormalizedKeyPoints;
 
     MatOfDMatch matches;
-
-    List<MatOfPoint> transformedCornersList;
+    MatOfDMatch matchesOutliersRemoved;
 
     List<DMatch> matchesList;
-
-    List<Point> srcPts;
-    List<Point> dstPts;
-    List<Point> cornerPts;
 
     final Scalar RED = new Scalar(255, 0, 0);
     final Scalar GREEN = new Scalar(0, 255, 0);
@@ -128,6 +127,9 @@ public class VSLAM_Pipeline extends OpenCvPipeline {
         // create BFMatcher object
         bfMatcher = BFMatcher.create(NORM_HAMMING, true);
         constructCameraMatrices();
+        previousImg = new Mat();
+        previousKeyPoints = new MatOfKeyPoint();
+        previousDescriptors = new Mat();
     }
 
     @Override
@@ -147,10 +149,19 @@ public class VSLAM_Pipeline extends OpenCvPipeline {
             //getPrevious();
             findKeyPointsAndDescriptorsORB();
             featureMatch();
-            homography();
+            RANSAC();
+            normalizeMatchedKeyPoints();
+            // TODO: Do all the odometry stuff
+            fundamentalAndEssentialMatrices();
         }
 
+
+
+
         releaseAllMats();
+
+        resizeOutputImg();
+
         return outputImg;
     }
 
@@ -200,53 +211,114 @@ public class VSLAM_Pipeline extends OpenCvPipeline {
         }
     }
 
-    public void homography() {
+    public void RANSAC() {
         if (!empty) {
             if (matches.toArray().length<MIN_MATCHES) {
                 empty = true;
                 return;
             }
 
-            ArrayList<Point> srcPts = new ArrayList<Point>();
+            ArrayList<Point> currentPts = new ArrayList<Point>();
             for (DMatch m : matches.toArray()) {
                 Point pt = keyPoints.toList().get(m.queryIdx).pt;
-                srcPts.add(pt);
+                currentPts.add(pt);
             }
 
-            MatOfPoint2f srcPoints = new MatOfPoint2f();
-            srcPoints.fromList(srcPts);
+            MatOfPoint2f currentPoints = new MatOfPoint2f();
+            currentPoints.fromList(currentPts);
 
-            ArrayList<Point> dstPts = new ArrayList<Point>();
+            ArrayList<Point> previousPts = new ArrayList<Point>();
             for (DMatch m : matches.toArray()) {
                 Point pt = previousKeyPoints.toList().get(m.trainIdx).pt;
-                dstPts.add(pt);
+                previousPts.add(pt);
             }
 
-            MatOfPoint2f dstPoints = new MatOfPoint2f();
-            dstPoints.fromList(dstPts);
+            MatOfPoint2f previousPoints = new MatOfPoint2f();
+            previousPoints.fromList(previousPts);
 
-            maskByte = new MatOfByte();
-            homography = Calib3d.findHomography(srcPoints, dstPoints, Calib3d.RANSAC, 5.0, maskByte);
+            Mat mask = new Mat();
+            matchesOutliersRemoved = new MatOfDMatch(Calib3d.findHomography(currentPoints, previousPoints, Calib3d.RANSAC, RANSAC_REPROJECTION_THRESHOLD, mask, MAX_ITERATIONS_RANSAC, INLIER_THRESHOLD_RANSAC));
 
-            if (homography != null) {
-                cornerPts = new ArrayList<>(4);
-                cornerPts.add(new Point(0, 0));
-                cornerPts.add(new Point(0, img.rows() - 1));
-                cornerPts.add(new Point(img.cols() - 1, img.rows() - 1));
-                cornerPts.add(new Point(img.cols() - 1, 0));
-                corners = new MatOfPoint2f(Converters.vector_Point2f_to_Mat(cornerPts));
-                transformedCorners = new MatOfPoint2f();
-                Core.perspectiveTransform(corners, transformedCorners, homography);
-                transformedCornersPoint = new MatOfPoint(transformedCorners.toArray());
-                transformedCornersList = new ArrayList<>();
-                transformedCornersList.add(transformedCornersPoint);
-                Imgproc.polylines(previousImg, transformedCornersList, true, RED, 3, Imgproc.LINE_AA);
-            } else {
-                maskByte = new MatOfByte(MatOfByte.zeros(matches.toList().size(), 1, (byte) 0));
-            }
-
-            Features2d.drawMatches(img, keyPoints, previousImg, previousKeyPoints, matches, outputImg, GREEN, BLUE, maskByte);
+            currentPoints.release();
+            previousPoints.release();
+            mask.release();
         }
+    }
+
+    public void normalizeMatchedKeyPoints() {
+        if (!empty) {
+            currentFrameNormalizedKeyPoints = new MatOfPoint2f();
+            previousFrameNormalizedKeyPoints = new MatOfPoint2f();
+
+            List<KeyPoint> currentMatchedKeypoints = new ArrayList<>();
+            List<KeyPoint> previousMatchedKeypoints = new ArrayList<>();
+
+            for (DMatch match : matches.toArray()) {
+                // Get the index of the matched keypoints in the original MatOfKeyPoint
+                int currentIdx = match.queryIdx;
+                int previousIdx = match.trainIdx;
+
+                // Get the matched keypoints from the original MatOfKeyPoint
+                KeyPoint keyPoint1 = keyPoints.toList().get(currentIdx);
+                KeyPoint keyPoint2 = previousKeyPoints.toList().get(previousIdx);
+
+                // Add the matched keypoints to their respective lists
+                currentMatchedKeypoints.add(keyPoint1);
+                previousMatchedKeypoints.add(keyPoint2);
+            }
+
+            double sumX = 0, sumY = 0;
+
+            for (KeyPoint kp : currentMatchedKeypoints) {
+                sumX += kp.pt.x;
+                sumY += kp.pt.y;
+            }
+            Point currentCentroid = new Point(sumX / currentMatchedKeypoints.size(), sumY / currentMatchedKeypoints.size());
+
+            sumX = 0;
+            sumY = 0;
+
+            for (KeyPoint kp : previousMatchedKeypoints) {
+                sumX += kp.pt.x;
+                sumY += kp.pt.y;
+            }
+            Point previousCentroid = new Point(sumX / currentMatchedKeypoints.size(), sumY / currentMatchedKeypoints.size());
+
+            double currentAvgDist = 0;
+            for (KeyPoint kp : currentMatchedKeypoints) {
+                double dx = kp.pt.x - currentCentroid.x;
+                double dy = kp.pt.y - currentCentroid.y;
+                currentAvgDist += Math.sqrt(dx * dx + dy * dy);
+            }
+            currentAvgDist /= currentMatchedKeypoints.size();
+
+            double previousAvgDist = 0;
+            for (KeyPoint kp : previousMatchedKeypoints) {
+                double dx = kp.pt.x - previousCentroid.x;
+                double dy = kp.pt.y - previousCentroid.y;
+                previousAvgDist += Math.sqrt(dx * dx + dy * dy);
+            }
+            previousAvgDist /= previousMatchedKeypoints.size();
+
+            List<Point> pointsList = new ArrayList<>();
+            for (KeyPoint kp : currentMatchedKeypoints) {
+                pointsList.add(new Point((kp.pt.x - currentCentroid.x) / currentAvgDist, (kp.pt.y - currentCentroid.y) / currentAvgDist));
+            }
+            currentFrameNormalizedKeyPoints.fromList(pointsList);
+
+            pointsList.clear();
+            for (KeyPoint kp : previousMatchedKeypoints) {
+                pointsList.add(new Point((kp.pt.x - previousCentroid.x) / previousAvgDist, (kp.pt.y - previousCentroid.y) / previousAvgDist));
+            }
+            previousFrameNormalizedKeyPoints.fromList(pointsList);
+        }
+    }
+    public void fundamentalAndEssentialMatrices() {
+
+    }
+
+    public void resizeOutputImg() {
+        Imgproc.resize(outputImg, outputImg, imgSize);
     }
 
     public void getPrevious() {
@@ -272,12 +344,12 @@ public class VSLAM_Pipeline extends OpenCvPipeline {
         if (maskByte != null) maskByte.release();
         if (matches != null) matches.release();
         if (undistorted != null) undistorted.release();
-        if (srcPoints != null) srcPoints.release();
-        if (dstPoints != null) dstPoints.release();
         if (homography != null) homography.release();
         if (corners != null) corners.release();
         if (transformedCorners != null) transformedCorners.release();
         if (transformedCornersPoint != null) transformedCornersPoint.release();
+        if (currentFrameNormalizedKeyPoints != null) currentFrameNormalizedKeyPoints.release();
+        if (previousFrameNormalizedKeyPoints != null) previousFrameNormalizedKeyPoints.release();
     }
 
     public void undistortImage() {
